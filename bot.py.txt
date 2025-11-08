@@ -1,0 +1,192 @@
+import os
+import time
+import requests
+
+BALLDONTLIE_API_KEY = os.getenv("BALLDONTLIE_API_KEY")
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+BDL_BASE = "https://api.balldontlie.io/v1"
+ODDS_BASE = "https://api.the-odds-api.com/v4"
+REGION = "eu"
+
+def send_alert(msg: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[ALERT]", msg)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=5)
+    except Exception as e:
+        print("[TELEGRAM ERROR]", e, msg)
+
+bdl_headers = {"Authorization": BALLDONTLIE_API_KEY} if BALLDONTLIE_API_KEY else {}
+
+def get_live_box_scores():
+    url = f"{BDL_BASE}/box_scores/live"
+    r = requests.get(url, headers=bdl_headers, timeout=10)
+    r.raise_for_status()
+    return r.json().get("data", [])
+
+def find_game(live_games, home_abbr, away_abbr):
+    for g in live_games:
+        try:
+            if (
+                g["home_team"]["abbreviation"].upper() == home_abbr.upper()
+                and g["visitor_team"]["abbreviation"].upper() == away_abbr.upper()
+            ):
+                return g
+        except KeyError:
+            continue
+    return None
+
+def estimate_team_possessions(team_stats: dict) -> float:
+    return (
+        team_stats.get("fg_attempts", 0)
+        + 0.44 * team_stats.get("ft_attempts", 0)
+        - team_stats.get("off_rebounds", 0)
+        + team_stats.get("turnovers", 0)
+    )
+
+def extract_game_state(g: dict) -> dict:
+    home = g["home_team"]
+    away = g["visitor_team"]
+    home_stats = g.get("home_stats", {}) or {}
+    away_stats = g.get("visitor_stats", {}) or {}
+    return {
+        "home_name": home["full_name"],
+        "away_name": away["full_name"],
+        "home_abbr": home["abbreviation"],
+        "away_abbr": away["abbreviation"],
+        "home_score": g["home_team_score"],
+        "away_score": g["visitor_team_score"],
+        "period": g["period"],
+        "time": g["time"],
+        "home_stats": home_stats,
+        "away_stats": away_stats,
+    }
+
+def minutes_elapsed_in_q(time_left_str: str, q_len: int = 12) -> float:
+    if not time_left_str or ":" not in time_left_str:
+        return 0.0
+    mins, secs = map(int, time_left_str.split(":"))
+    return q_len - (mins + secs / 60.0)
+
+def get_nba_odds_totals():
+    if not ODDS_API_KEY:
+        return []
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": REGION,
+        "markets": "totals",
+        "oddsFormat": "decimal"
+    }
+    url = f"{ODDS_BASE}/sports/basketball_nba/odds"
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def find_game_total_line(odds_data, home_team_name, away_team_name, bookmaker_key=None):
+    for event in odds_data:
+        if event.get("home_team") == home_team_name and event.get("away_team") == away_team_name:
+            bookmakers = event.get("bookmakers", [])
+            bookmaker = None
+
+            if bookmaker_key:
+                for b in bookmakers:
+                    if b["key"] == bookmaker_key:
+                        bookmaker = b
+                        break
+
+            if not bookmaker:
+                if not bookmakers:
+                    return None
+                bookmaker = bookmakers[0]
+
+            for m in bookmaker.get("markets", []):
+                if m.get("key") == "totals" and m.get("outcomes"):
+                    return m["outcomes"][0]["point"]
+    return None
+
+def should_trigger_over_q(state: dict, live_line: float, q: int) -> bool:
+    if state["period"] != q or live_line is None:
+        return False
+
+    M = minutes_elapsed_in_q(state["time"])
+    if M < 2 or M > 8:
+        return False
+
+    P = state["home_score"] + state["away_score"]
+    poss_home = estimate_team_possessions(state["home_stats"])
+    poss_away = estimate_team_possessions(state["away_stats"])
+    poss_total = poss_home + poss_away
+
+    if M <= 0 or poss_total <= 0:
+        return False
+
+    pace_proj = (poss_total / M) * 12
+    diff = abs(state["home_score"] - state["away_score"])
+
+    if q == 1:
+        return live_line <= 56.5 and P >= 4 * M and pace_proj >= 48
+    if q == 2:
+        return live_line <= 55.5 and P >= 4 * M and pace_proj >= 46
+    if q == 3:
+        return live_line <= 54.5 and P >= 3.8 * M and pace_proj >= 46 and diff < 18
+    if q == 4:
+        return live_line <= 52.5 and P >= 3.8 * M and pace_proj >= 46 and diff <= 12
+
+    return False
+
+def monitor_game(home_abbr: str, away_abbr: str, bookmaker_key: str = None):
+    alerted = {1: False, 2: False, 3: False, 4: False}
+
+    while True:
+        live_games = get_live_box_scores()
+        g = find_game(live_games, home_abbr, away_abbr)
+        if not g:
+            time.sleep(5)
+            continue
+
+        state = extract_game_state(g)
+        if state["period"] > 4:
+            break
+
+        odds_data = get_nba_odds_totals()
+        total_line = find_game_total_line(
+            odds_data,
+            state["home_name"],
+            state["away_name"],
+            bookmaker_key=bookmaker_key
+        )
+
+        live_q_lines = {1: None, 2: None, 3: None, 4: None}
+        if total_line:
+            live_q_lines[1] = total_line / 4
+            live_q_lines[2] = total_line / 4
+            live_q_lines[3] = total_line / 4
+            live_q_lines[4] = (total_line / 4) - 1.5
+
+        q = state["period"]
+        live_line_q = live_q_lines.get(q)
+
+        if not alerted[q] and should_trigger_over_q(state, live_line_q, q):
+            msg = (
+                f"[ALERT NBA LIVE]\n"
+                f"{state['home_abbr']} - {state['away_abbr']} | Q{q}\n"
+                f"Scor: {state['home_score']}-{state['away_score']} | Timp: {state['time']}\n"
+                f"Linie estimată Q{q}: {live_line_q:.1f} (total meci {total_line})\n"
+                f"Condiții îndeplinite pentru Over Q{q}."
+            )
+            send_alert(msg)
+            alerted[q] = True
+
+        if q >= 4 and state["time"].startswith("0"):
+            break
+
+        time.sleep(5)
+
+if __name__ == "__main__":
+    # exemplu: WAS vs DAL
+    monitor_game("WAS", "DAL")
